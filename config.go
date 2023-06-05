@@ -5,12 +5,12 @@ package gofiberfirebaseauth
 import (
 	"context"
 	"errors"
-	"fmt"
-
 	firebase "firebase.google.com/go"
 	"firebase.google.com/go/auth"
 	"github.com/gofiber/fiber/v2"
 )
+
+var ErrEmailNotVerified = errors.New("email not verified")
 
 type User struct {
 	EmailVerified bool
@@ -19,15 +19,6 @@ type User struct {
 
 // Config defines the config for middleware
 type Config struct {
-
-	// New firebase authntication object
-	// Mandatory. Default: nil
-	FirebaseApp *firebase.App
-
-	// Ignore urls array
-	// Optional. Default: nil
-	IgnoreUrls []string
-
 	// Skip Email Check.
 	// Optional. Default: nil
 	CheckEmailVerified bool
@@ -42,7 +33,7 @@ type Config struct {
 
 	// Authorizer defines a function which authenticate the Authorization token and return the authenticated token
 	// Optional. Default: nil
-	Authorizer func(string, string) (*auth.Token, error)
+	Authorizer func(string) (*auth.Token, error)
 
 	// SuccessHandler defines a function which is executed for a valid token.
 	// Optional. Default: nil
@@ -56,111 +47,71 @@ type Config struct {
 	// Context key to store user information from the token into context.
 	// Optional. Default: "user".
 	ContextKey string
+
+	TokenExtractor ExtractorFun
+	TokenCallback  func(ctx *fiber.Ctx, token *auth.Token) error
 }
 
 // ConfigDefault is the default config
 var ConfigDefault = Config{
-	Next:                          nil,
-	IgnoreUrls:                    nil,
-	Authorizer:                    nil,
-	ErrorHandler:                  nil,
-	SuccessHandler:                nil,
-	CheckEmailVerified:            false,
-	CheckEmailVerifiedIgnoredUrls: nil,
-	ContextKey:                    "",
+	ErrorHandler: func(c *fiber.Ctx, err error) error {
+		return c.Status(fiber.StatusBadRequest).SendString(err.Error())
+	},
+	SuccessHandler: func(c *fiber.Ctx) error {
+		return c.Next()
+	},
+	ContextKey:     "user",
+	TokenExtractor: NewHeaderExtractor(),
 }
 
 // Initializer
-func configDefault(config ...Config) Config {
+func configDefault(app *firebase.App, config ...Config) Config {
 	// Return default config if nothing provided
-	if len(config) < 1 {
-		return ConfigDefault
-	}
-
-	// Override default config
-	cfg := config[0]
-
-	if cfg.ContextKey == "" {
-		cfg.ContextKey = "user"
-	}
-
-	// Check Mandatory FirebaseApp is provided
-	if cfg.FirebaseApp == nil {
-		fmt.Println("****************************************************************")
-		fmt.Println("gofiberfirebaseauth :: Error PLEASE PASS Firebase App in Config")
-		fmt.Println("*****************************************************************")
+	var cfg Config
+	if len(config) > 0 {
+		cfg = config[0]
 	}
 
 	// Set default values
+	if cfg.ContextKey == "" {
+		cfg.ContextKey = ConfigDefault.ContextKey
+	}
 	if cfg.Next == nil {
 		cfg.Next = ConfigDefault.Next
 	}
-
 	if cfg.SuccessHandler == nil {
-		cfg.SuccessHandler = func(c *fiber.Ctx) error {
-			return c.Next()
-		}
+		cfg.SuccessHandler = ConfigDefault.SuccessHandler
 	}
-
-	// Default Authorizer function
 	if cfg.Authorizer == nil {
-		cfg.Authorizer = func(IDToken string, CurrentURL string) (*auth.Token, error) {
-			if cfg.FirebaseApp == nil {
-				return nil, errors.New("Missing Firebase App Object")
-			}
-			client, err := cfg.FirebaseApp.Auth(context.Background())
-			// Verify IDToken
-			token, err := client.VerifyIDToken(context.Background(), IDToken)
-
-			// Throw error for bad token
+		cfg.Authorizer = func(tokenCandidate string) (*auth.Token, error) {
+			client, err := app.Auth(context.Background())
 			if err != nil {
-				return nil, errors.New("Malformed Token")
+				return nil, err
 			}
-
-			// IF CheckEmailVerified enable in config check email is verified
-			if cfg.CheckEmailVerified {
-				checkEmail := false
-				if cfg.CheckEmailVerifiedIgnoredUrls != nil && len(cfg.CheckEmailVerifiedIgnoredUrls) > 0 {
-					for i := range cfg.IgnoreUrls {
-						if cfg.CheckEmailVerifiedIgnoredUrls[i] == CurrentURL {
-							checkEmail = true
-						}
-					}
-				}
-
-				if checkEmail {
-					// Claim email_verified from token
-					if !token.Claims["email_verified"].(bool) {
-						return nil, errors.New("Email not verified")
-					}
-				}
+			token, err := client.VerifyIDToken(context.Background(), tokenCandidate)
+			if err != nil {
+				return nil, err
 			}
-
+			if cfg.CheckEmailVerified && !token.Claims["email_verified"].(bool) {
+				return nil, ErrEmailNotVerified
+			}
 			return token, nil
 		}
 	}
-
-	// Default Error Handler
 	if cfg.ErrorHandler == nil {
-		cfg.ErrorHandler = func(c *fiber.Ctx, err error) error {
-			if err.Error() == "Missing Token" {
-				return c.Status(fiber.StatusBadRequest).SendString("Missing or malformed Token")
-			}
-
-			if err.Error() == "Malformed Token" {
-				return c.Status(fiber.StatusBadRequest).SendString("Missing or malformed Token")
-			}
-
-			if err.Error() == "Email not verified" {
-				return c.Status(fiber.StatusBadRequest).SendString("Missing or malformed Token")
-			}
-
-			if err.Error() == "Missing Firebase App Object" {
-				return c.Status(fiber.StatusBadRequest).SendString("Missing or Invalid Firebase App Object")
-			}
-
-			return c.Status(fiber.StatusUnauthorized).SendString("Invalid or expired Token")
-
+		cfg.ErrorHandler = ConfigDefault.ErrorHandler
+	}
+	if cfg.TokenExtractor == nil {
+		cfg.TokenExtractor = ConfigDefault.TokenExtractor
+	}
+	if cfg.TokenCallback == nil {
+		cfg.TokenCallback = func(ctx *fiber.Ctx, token *auth.Token) error {
+			ctx.Locals(cfg.ContextKey, User{
+				Email:         token.Claims["email"].(string),
+				EmailVerified: token.Claims["email_verified"].(bool),
+				UserID:        token.Claims["user_id"].(string),
+			})
+			return nil
 		}
 	}
 
